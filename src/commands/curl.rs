@@ -103,6 +103,52 @@ fn is_absolute(loc: &str) -> bool {
     })
 }
 
+/// The values a `-w` format can name.
+struct WriteOut<'a> {
+    /// The response status, or `0` when no response arrived.
+    status: u16,
+    content_type: &'a str,
+    size_download: usize,
+    url_effective: &'a str,
+}
+
+/// Expand a `-w` format in one pass, so a substituted value, such as a server's
+/// `Content-Type`, is never itself read as a variable or an escape.
+fn expand_write_out(fmt: &str, vars: &WriteOut) -> String {
+    let mut s = String::new();
+    let mut rest = fmt;
+    while let Some(i) = rest.find(['%', '\\']) {
+        s.push_str(&rest[..i]);
+        rest = &rest[i..];
+        if let Some(after) = rest.strip_prefix("\\n") {
+            s.push('\n');
+            rest = after;
+            continue;
+        }
+        if let Some(after) = rest.strip_prefix("%{")
+            && let Some(end) = after.find('}')
+        {
+            let value = match &after[..end] {
+                "http_code" | "response_code" => Some(format!("{:03}", vars.status)),
+                "content_type" => Some(vars.content_type.to_string()),
+                "size_download" => Some(vars.size_download.to_string()),
+                "url_effective" => Some(vars.url_effective.to_string()),
+                _ => None,
+            };
+            if let Some(value) = value {
+                s.push_str(&value);
+                rest = &after[end + 1..];
+                continue;
+            }
+        }
+        // Not a token this `curl` knows: keep the character as written.
+        s.push_str(&rest[..1]);
+        rest = &rest[1..];
+    }
+    s.push_str(rest);
+    s
+}
+
 /// Bound `fut` by the `--max-time` deadline, reporting a lapse as `TimedOut`.
 #[cfg(not(target_arch = "wasm32"))]
 async fn within<T>(
@@ -186,7 +232,8 @@ async fn cmd_curl(os: &dyn Kernel, args: &[String]) -> CommandResult {
                 let redir = matches!(arg, Long("proto-redir"));
                 let list = parser.value()?.string()?;
                 let set = if redir { &mut proto_redir } else { &mut proto };
-                match set.apply(&list) {
+                // Each flag starts from every protocol, so the last one wins, as in curl.
+                match Protocols::ALL.apply(&list) {
                     Some(p) => *set = p,
                     None => {
                         let mut w = io::stderr()?;
@@ -218,8 +265,11 @@ async fn cmd_curl(os: &dyn Kernel, args: &[String]) -> CommandResult {
 
     let max_time = match max_time.as_deref().map(str::parse::<f64>) {
         None => None,
+        // A limit too large to represent is no limit.
         Some(Ok(secs)) if secs.is_finite() && secs >= 0.0 => {
-            Some(std::time::Duration::from_secs_f64(secs)).filter(|d| !d.is_zero())
+            std::time::Duration::try_from_secs_f64(secs)
+                .ok()
+                .filter(|d| !d.is_zero())
         }
         Some(_) => {
             let mut w = io::stderr()?;
@@ -231,7 +281,7 @@ async fn cmd_curl(os: &dyn Kernel, args: &[String]) -> CommandResult {
         }
     };
     #[cfg(not(target_arch = "wasm32"))]
-    let deadline = max_time.map(|d| tokio::time::Instant::now() + d);
+    let deadline = max_time.and_then(|d| tokio::time::Instant::now().checked_add(d));
     #[cfg(target_arch = "wasm32")]
     let deadline = max_time.map(|_| ());
 
@@ -360,6 +410,16 @@ async fn cmd_curl(os: &dyn Kernel, args: &[String]) -> CommandResult {
                     {
                         wprintln!(w, "curl: (28) Operation timed out")?;
                     }
+                    if let Some(ref fmt) = write_out {
+                        let vars = WriteOut {
+                            status: 0,
+                            content_type: "",
+                            size_download: 0,
+                            url_effective: &current_url,
+                        };
+                        let mut w = io::stdout()?;
+                        wprint!(w, "{}", expand_write_out(fmt, &vars))?;
+                    }
                     return Ok(28);
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
@@ -429,6 +489,16 @@ async fn cmd_curl(os: &dyn Kernel, args: &[String]) -> CommandResult {
                     {
                         wprintln!(w, "curl: (28) Operation timed out")?;
                     }
+                    if let Some(ref fmt) = write_out {
+                        let vars = WriteOut {
+                            status: 0,
+                            content_type: "",
+                            size_download: 0,
+                            url_effective: &current_url,
+                        };
+                        let mut w = io::stdout()?;
+                        wprint!(w, "{}", expand_write_out(fmt, &vars))?;
+                    }
                     return Ok(28);
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
@@ -483,14 +553,16 @@ async fn cmd_curl(os: &dyn Kernel, args: &[String]) -> CommandResult {
     };
 
     let status_code = resp.status;
+    let content_type = resp
+        .headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+        .map_or("", |(_, v)| v.as_str());
 
-    // Take stdout once up front
-    let mut out = if output.is_none() {
-        Some(io::stdout()?)
-    } else {
-        None
-    };
+    // `-o` takes the body and the `-i` headers; `-w` always goes to stdout.
+    let mut out = io::stdout()?;
 
+    let mut included: Option<String> = None;
     if verbose || include {
         let mut hdr = format!("HTTP/{} {} {}\r\n", resp.version, status_code, resp.reason);
         for (name, value) in &resp.headers {
@@ -498,9 +570,7 @@ async fn cmd_curl(os: &dyn Kernel, args: &[String]) -> CommandResult {
         }
         hdr.push_str("\r\n");
         if include {
-            if let Some(ref mut w) = out {
-                w.write_all(hdr.as_bytes()).await?;
-            }
+            included = Some(hdr);
         } else if let Some(ref mut w) = err {
             w.write_all(hdr.as_bytes()).await?;
         }
@@ -514,35 +584,42 @@ async fn cmd_curl(os: &dyn Kernel, args: &[String]) -> CommandResult {
                 status_code
             )?;
         }
+        if let Some(ref fmt) = write_out {
+            let vars = WriteOut {
+                status: status_code,
+                content_type,
+                size_download: 0,
+                url_effective: &current_url,
+            };
+            wprint!(out, "{}", expand_write_out(fmt, &vars))?;
+        }
         return Ok(22);
     }
 
     let body_bytes = &resp.body;
-    let content_type = resp
-        .headers
-        .iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
-        .map_or("", |(_, v)| v.as_str());
 
     if let Some(ref path) = output {
         let fd = io::open(os, path, OpenFlags::write()).await?;
         let mut w = io::take_writer(fd)?;
+        if let Some(ref hdr) = included {
+            w.write_all(hdr.as_bytes()).await?;
+        }
         w.write_all(body_bytes).await?;
-    } else if let Some(ref mut w) = out {
-        w.write_all(body_bytes).await?;
+    } else {
+        if let Some(ref hdr) = included {
+            out.write_all(hdr.as_bytes()).await?;
+        }
+        out.write_all(body_bytes).await?;
     }
 
     if let Some(ref fmt) = write_out {
-        let s = fmt
-            .replace("%{http_code}", &status_code.to_string())
-            .replace("%{response_code}", &status_code.to_string())
-            .replace("%{content_type}", content_type)
-            .replace("%{url_effective}", &current_url)
-            .replace("%{size_download}", &body_bytes.len().to_string())
-            .replace("\\n", "\n");
-        if let Some(ref mut w) = out {
-            wprint!(w, "{}", s)?;
-        }
+        let vars = WriteOut {
+            status: status_code,
+            content_type,
+            size_download: body_bytes.len(),
+            url_effective: &current_url,
+        };
+        wprint!(out, "{}", expand_write_out(fmt, &vars))?;
     }
 
     Ok(0)

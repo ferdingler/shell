@@ -45,6 +45,22 @@ async fn start_server() -> String {
             }),
         )
         .route(
+            "/redirect-slow",
+            get(|| async { Redirect::temporary("/slow") }),
+        )
+        .route(
+            "/tricky-content-type",
+            get(|| async {
+                (
+                    [(
+                        axum::http::header::CONTENT_TYPE,
+                        r"text/plain;%{url_effective}\n",
+                    )],
+                    "body",
+                )
+            }),
+        )
+        .route(
             "/redirect-ftp",
             get(|| async { Redirect::temporary("ftp://example.com/file") }),
         );
@@ -875,7 +891,7 @@ fn curl_write_out_url_effective() {
     }));
 }
 
-// The command line `web_fetch` sends, less `-o`.
+// The command line `web_fetch` sends: the body goes to the file, `-w` to stdout.
 #[test]
 fn curl_web_fetch_command_line() {
     let (rt, local) = rt();
@@ -884,14 +900,144 @@ fn curl_web_fetch_command_line() {
         let out = shell
             .run(&format!(
                 "curl -sSL -g --fail --proto '=http,https' --proto-redir '=http,https' \
-                 --max-time 30 -A 'web-fetch/1.0' \
-                 -w '\\n%{{content_type}}\\n%{{url_effective}}' -- {base}/redirect"
+                 --max-time 30 -A 'web-fetch/1.0' -o /tmp/page.txt \
+                 -w '%{{content_type}}\\n%{{url_effective}}' -- {base}/redirect; \
+                 echo; cat /tmp/page.txt"
             ))
             .await;
         assert_eq!(out.status, 0, "{}", out.stderr);
         assert_eq!(
             out.stdout,
-            format!("Hello, World!\ntext/plain; charset=utf-8\n{base}/hello")
+            format!("text/plain; charset=utf-8\n{base}/hello\nHello, World!")
         );
+    }));
+}
+
+#[test]
+fn curl_write_out_reaches_stdout_with_output() {
+    let (rt, local) = rt();
+    rt.block_on(local.run_until(async {
+        let (mut shell, base) = shell_with_server().await;
+        let out = shell
+            .run(&format!(
+                "curl -s -o /tmp/body.txt -w '%{{http_code}}' {base}/hello; echo; cat /tmp/body.txt"
+            ))
+            .await;
+        assert_eq!(out.stdout, "200\nHello, World!");
+    }));
+}
+
+#[test]
+fn curl_include_with_output_writes_headers_to_the_file() {
+    let (rt, local) = rt();
+    rt.block_on(local.run_until(async {
+        let (mut shell, base) = shell_with_server().await;
+        let out = shell
+            .run(&format!("curl -s -i -o /tmp/inc.txt {base}/hello"))
+            .await;
+        assert_eq!(out.stdout, "");
+        let out = shell.run("cat /tmp/inc.txt").await;
+        assert!(
+            out.stdout.starts_with("HTTP/1.1 200 OK\r\n"),
+            "{}",
+            out.stdout
+        );
+        assert!(
+            out.stdout.ends_with("\r\n\r\nHello, World!"),
+            "{}",
+            out.stdout
+        );
+    }));
+}
+
+#[test]
+fn curl_write_out_on_fail() {
+    let (rt, local) = rt();
+    rt.block_on(local.run_until(async {
+        let (mut shell, base) = shell_with_server().await;
+        let out = shell
+            .run(&format!("curl -sf -w '%{{http_code}}' {base}/status/404"))
+            .await;
+        assert_eq!(out.status, 22);
+        assert_eq!(out.stdout, "404");
+    }));
+}
+
+#[test]
+fn curl_write_out_on_timeout() {
+    let (rt, local) = rt();
+    rt.block_on(local.run_until(async {
+        let (mut shell, base) = shell_with_server().await;
+        let out = shell
+            .run(&format!(
+                "curl -s -m 0.2 -w '%{{http_code}} %{{url_effective}}' {base}/slow"
+            ))
+            .await;
+        assert_eq!(out.status, 28);
+        assert_eq!(out.stdout, format!("000 {base}/slow"));
+    }));
+}
+
+// A server's `Content-Type` is written as sent, never expanded again.
+#[test]
+fn curl_write_out_does_not_expand_a_substituted_value() {
+    let (rt, local) = rt();
+    rt.block_on(local.run_until(async {
+        let (mut shell, base) = shell_with_server().await;
+        let out = shell
+            .run(&format!(
+                "curl -s -o /dev/null -w '%{{content_type}}|' {base}/tricky-content-type"
+            ))
+            .await;
+        assert_eq!(out.stdout, r"text/plain;%{url_effective}\n|");
+    }));
+}
+
+#[test]
+fn curl_max_time_spans_redirect_hops() {
+    let (rt, local) = rt();
+    rt.block_on(local.run_until(async {
+        let (mut shell, base) = shell_with_server().await;
+        let out = shell
+            .run(&format!("curl -sL -m 0.3 {base}/redirect-slow"))
+            .await;
+        assert_eq!(out.status, 28);
+    }));
+}
+
+#[test]
+fn curl_max_time_zero_and_huge_are_no_limit() {
+    let (rt, local) = rt();
+    rt.block_on(local.run_until(async {
+        let (mut shell, base) = shell_with_server().await;
+        for limit in ["0", "1e19", "1e300", "99999999999999999999"] {
+            let out = shell.run(&format!("curl -m {limit} {base}/hello")).await;
+            assert_eq!(out.status, 0, "-m {limit}: {}", out.stderr);
+            assert_eq!(out.stdout, "Hello, World!", "-m {limit}");
+        }
+    }));
+}
+
+#[test]
+fn curl_empty_user_agent_sends_none() {
+    let (rt, local) = rt();
+    rt.block_on(local.run_until(async {
+        let (mut shell, base) = shell_with_server().await;
+        let out = shell.run(&format!("curl -A '' {base}/echo")).await;
+        assert!(!out.stdout.contains("user-agent="), "{}", out.stdout);
+    }));
+}
+
+// Each `--proto` replaces the one before it.
+#[test]
+fn curl_last_proto_wins() {
+    let (rt, local) = rt();
+    rt.block_on(local.run_until(async {
+        let (mut shell, base) = shell_with_server().await;
+        let out = shell
+            .run(&format!("curl --proto -http --proto -https {base}/hello"))
+            .await;
+        assert_eq!(out.status, 0, "{}", out.stderr);
+        assert_eq!(out.stdout, "Hello, World!");
     }));
 }
