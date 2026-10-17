@@ -59,12 +59,12 @@ impl MemKernel {
 
 fn resolve(proc: &Process, path: &str) -> String {
     let joined = if path.starts_with('/') {
-        PathBuf::from(path)
+        path.to_string()
     } else {
-        proc.cwd.join(path)
+        format!("{}/{}", proc.cwd.display(), path)
     };
     let mut parts: Vec<String> = Vec::new();
-    for part in joined.to_string_lossy().split('/') {
+    for part in joined.split('/') {
         match part {
             "" | "." => {}
             ".." => {
