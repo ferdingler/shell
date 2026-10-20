@@ -571,6 +571,7 @@ fn curl_safe_resolver_blocks_loopback_dns() {
 fn curl_redirect_to_blocked_ip_denied() {
     let (rt, local) = rt();
     rt.block_on(local.run_until(async {
+        // `base` is allowlisted and redirects to `target`, which deliberately is not.
         let target = start_server().await;
         let location = format!("{target}/hello");
         let app = Router::new().route(
@@ -1054,7 +1055,11 @@ fn curl_max_time_spans_redirect_hops() {
             .await;
         assert_eq!(out.status, 28);
         assert_eq!(out.stdout, format!("{base}/slow-hop-end"));
-        assert!(started.elapsed() >= std::time::Duration::from_millis(800));
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= std::time::Duration::from_millis(800),
+            "the deadline spans both hops, so it must be >= 800ms, got {elapsed:?}"
+        );
     }));
 }
 
