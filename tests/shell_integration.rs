@@ -1512,6 +1512,53 @@ expect!(
     "1"
 );
 
+// ── builtin builtin ─────────────────────────────────────────────────
+
+expect!(builtin_runs_echo, "builtin echo hello", "hello");
+expect!(builtin_passes_args, "builtin printf '%s-%s\\n' a b", "a-b");
+expect!(builtin_keeps_status, "builtin false; echo $?", "1");
+expect!(builtin_no_args, "builtin", "");
+expect!(
+    builtin_bypasses_function,
+    "echo() { printf 'shadowed\\n'; }; builtin echo real",
+    "real"
+);
+expect!(
+    builtin_in_wrapper_function,
+    "go() { builtin cd \"$@\"; }; go /tmp; pwd",
+    "/tmp"
+);
+expect!(
+    builtin_special_return,
+    "f() { builtin return 4; echo unreachable; }; f; echo $?",
+    "4"
+);
+expect_status!(builtin_special_exit, "builtin exit 3; echo unreachable", 3);
+
+shell_test!(
+    builtin_rejects_command,
+    "builtin cat /dev/null",
+    |_shell: &mut Shell, out: strands_shell::Output| {
+        assert_eq!(out.status, 1);
+        assert_eq!(
+            out.stderr.trim(),
+            "strands-shell: builtin: cat: not a shell builtin"
+        );
+    }
+);
+
+shell_test!(
+    builtin_rejects_unknown,
+    "builtin nosuch_xyz",
+    |_shell: &mut Shell, out: strands_shell::Output| {
+        assert_eq!(out.status, 1);
+        assert_eq!(
+            out.stderr.trim(),
+            "strands-shell: builtin: nosuch_xyz: not a shell builtin"
+        );
+    }
+);
+
 // ── Redirections: read-write, dup, close ────────────────────────────
 
 expect!(
