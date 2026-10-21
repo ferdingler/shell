@@ -781,6 +781,43 @@ fn redir_stderr_to_file() {
     }));
 }
 
+// A redirect that cannot open reports why, for a builtin and for a command alike.
+#[test]
+fn redir_open_failure_reports_on_stderr() {
+    let (rt, local) = rt();
+    rt.block_on(local.run_until(async {
+        let mut shell = Shell::builder().build().unwrap();
+        for (cmd, written) in [
+            ("echo hi", "hi\n"),
+            ("printf x", "x"),
+            ("cat /dev/null", ""),
+        ] {
+            let out = shell.run(&format!("{cmd} > /nonexistent/x")).await;
+            assert_eq!(out.status, 1, "{cmd}: status");
+            assert!(out.stdout.is_empty(), "{cmd}: stdout {:?}", out.stdout);
+            assert!(
+                out.stderr.contains("/nonexistent/x")
+                    && out.stderr.to_lowercase().contains("no such file"),
+                "{cmd}: stderr {:?}",
+                out.stderr
+            );
+
+            let out = shell.run(&format!("{cmd} > /tmp/redir_ok")).await;
+            assert_eq!(out.status, 0, "{cmd}: control status");
+            assert!(
+                out.stderr.is_empty(),
+                "{cmd}: control stderr {:?}",
+                out.stderr
+            );
+            let out = shell
+                .run("test -f /tmp/redir_ok && cat /tmp/redir_ok")
+                .await;
+            assert_eq!(out.status, 0, "{cmd}: control file missing");
+            assert_eq!(out.stdout, written, "{cmd}: control file");
+        }
+    }));
+}
+
 // Clobber redirect >|
 expect!(redir_clobber, "echo hello >| /tmp/r; cat /tmp/r", "hello");
 

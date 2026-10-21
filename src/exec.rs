@@ -2569,6 +2569,7 @@ async fn run_pipeline(
 
             // Apply redirects to the io_proc so builtins see them
             if let Err(e) = apply_redirects(&os, &mut io_proc, &expanded_redirects[0]).await {
+                shell_proc.clear_err_tx();
                 shell_proc.err_msg(&format!("strands-shell: {e}"));
                 return (1, String::new());
             }
