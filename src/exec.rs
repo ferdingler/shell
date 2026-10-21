@@ -1815,6 +1815,12 @@ async fn execute_command_line_inner(
 
             last_exit = execute_item(os.clone(), proc, item).await?;
             proc.last_exit = last_exit;
+            if last_exit == 0
+                && let Some(msg) = proc.check_limits()
+            {
+                proc.err_msg(msg);
+                return Err(ControlFlow::Exit(1));
+            }
 
             // errexit: if set -e is active and command failed and not in tested context
             if proc.opt_errexit && last_exit != 0 && !tested {

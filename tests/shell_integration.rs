@@ -3404,8 +3404,6 @@ fn timeout_is_per_command_not_cumulative() {
 
 // And the deadline must still actually fire mid-command for slow
 // commands — refreshing on entry shouldn't disable enforcement.
-// Uses a busy `while true` loop because the `sleep` builtin races
-// the deadline silently and exits 0.
 #[test]
 fn timeout_still_fires_within_a_command() {
     let (rt, local) = rt();
@@ -3421,6 +3419,41 @@ fn timeout_still_fires_within_a_command() {
             "expected timeout error, got: {:?}",
             out.stderr
         );
+    }));
+}
+
+// A sleep cut short by the deadline did not happen, so it must fail
+// with the timeout error rather than exit 0.
+#[test]
+fn timeout_interrupts_sleep_with_failure() {
+    let (rt, local) = rt();
+    rt.block_on(local.run_until(async {
+        let mut shell = Shell::builder()
+            .timeout(std::time::Duration::from_millis(200))
+            .build()
+            .unwrap();
+        let out = shell.run("sleep 5").await;
+        assert_ne!(out.status, 0, "sleep past the deadline must fail");
+        assert_eq!(
+            out.stderr.trim(),
+            "strands-shell: execution timeout exceeded",
+            "stderr={:?}",
+            out.stderr
+        );
+    }));
+}
+
+#[test]
+fn sleep_within_timeout_succeeds() {
+    let (rt, local) = rt();
+    rt.block_on(local.run_until(async {
+        let mut shell = Shell::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let out = shell.run("sleep 0.05").await;
+        assert_eq!(out.status, 0, "stderr={:?}", out.stderr);
+        assert!(out.stderr.is_empty(), "stderr={:?}", out.stderr);
     }));
 }
 
