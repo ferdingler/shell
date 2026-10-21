@@ -2656,6 +2656,21 @@ expect!(
     "printf 'a\\nb\\nc\\nd\\ne\\n' | tail -n +3",
     "c\nd\ne"
 );
+expect!(
+    tail_legacy_count_stdin,
+    "printf 'a\\nb\\nc\\n' | tail -1",
+    "c"
+);
+expect!(
+    tail_legacy_count_from_file,
+    "printf 'a\\nb\\nc\\nd\\n' > /tmp/tl; tail -2 /tmp/tl",
+    "c\nd"
+);
+expect!(
+    tail_dash_operand_after_terminator,
+    "printf 'a\\nb\\n' > /tmp/-2; cd /tmp; tail -n1 -- -2",
+    "b"
+);
 
 // ── uniq coverage ───────────────────────────────────────────────────
 
@@ -2710,6 +2725,31 @@ shell_test!(
         assert_eq!(out.stdout, "ab\n\n");
         assert_eq!(out.status, 0);
     }
+);
+expect!(
+    head_legacy_count_stdin,
+    "printf 'a\\nb\\nc\\n' | head -2",
+    "a\nb"
+);
+expect!(
+    head_legacy_count_from_file,
+    "printf 'a\\nb\\nc\\nd\\n' > /tmp/hl; head -3 /tmp/hl",
+    "a\nb\nc"
+);
+expect!(
+    head_legacy_count_then_lines_last_wins,
+    "printf 'a\\nb\\nc\\n' | head -2 -n1",
+    "a"
+);
+expect!(
+    head_dash_operand_after_terminator,
+    "printf 'a\\nb\\n' > /tmp/-3; cd /tmp; head -n1 -- -3",
+    "a"
+);
+expect!(
+    head_bytes_after_legacy_count,
+    "printf 'abcdef' | head -3 -c 2",
+    "ab"
 );
 expect!(head_bytes_stdin, "printf 'abcdef' | head -c 3", "abc");
 expect!(head_bytes_long, "printf 'abcdef' | head --bytes=2", "ab");
