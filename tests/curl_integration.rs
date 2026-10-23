@@ -548,9 +548,9 @@ fn curl_blocked_scheme() {
     }));
 }
 
-// `localhost.` passes `check_url_safe`, so only the SafeResolver refuses it.
+// `localhost.` is refused before any connection, like `localhost`.
 #[test]
-fn curl_safe_resolver_blocks_loopback_dns() {
+fn curl_localhost_with_trailing_dot_denied() {
     let (rt, local) = rt();
     rt.block_on(local.run_until(async {
         let base = start_server().await;
@@ -562,7 +562,8 @@ fn curl_safe_resolver_blocks_loopback_dns() {
         let out = shell
             .run(&format!("curl http://localhost.:{port}/hello"))
             .await;
-        assert_eq!(out.status, 6, "{}", out.stderr);
+        assert_ne!(out.status, 0);
+        assert!(out.stderr.contains("access denied"), "{}", out.stderr);
         assert_eq!(out.stdout, "");
     }));
 }
