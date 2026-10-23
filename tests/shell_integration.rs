@@ -1760,6 +1760,16 @@ fn readonly_var() {
 // ── unset ───────────────────────────────────────────────────────────
 
 expect!(unset_var, "X=hello; unset X; echo \"${X:-gone}\"", "gone");
+expect!(
+    unset_option_terminator_treats_dash_f_as_name,
+    "X=hello; unset -- -f X; echo \"${X:-gone}\"",
+    "gone"
+);
+expect!(
+    unset_func_option_terminator,
+    "f() { echo hi; }; unset -f -- f; f 2>/dev/null; echo $?",
+    "127"
+);
 #[test]
 fn unset_func() {
     let (rt, local) = rt();
@@ -2962,6 +2972,16 @@ expect!(
     unalias_all,
     "alias a=1; alias b=2; unalias -a; alias; echo done",
     "done"
+);
+expect!(
+    unalias_option_terminator,
+    "alias ll=ls; unalias -- ll; echo $?; alias ll 2>/dev/null; echo $?",
+    "0\n1"
+);
+expect!(
+    unalias_option_terminator_keeps_dash_a_as_name,
+    "alias a=1; unalias -- -a 2>/dev/null; echo $?; alias a",
+    "1\na='1'"
 );
 
 // ── hash builtin ────────────────────────────────────────────────────
