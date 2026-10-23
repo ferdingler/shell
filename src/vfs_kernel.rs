@@ -1387,7 +1387,8 @@ pub fn check_url_safe(url: &str) -> io::Result<()> {
             }
         }
         Some(url::Host::Domain(d)) => {
-            if d == "localhost" || d.ends_with(".localhost") {
+            let name = d.strip_suffix('.').unwrap_or(d);
+            if name == "localhost" || name.ends_with(".localhost") {
                 return Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
                     format!("access denied: {d}"),
@@ -1461,6 +1462,9 @@ mod url_safety_tests {
             "http://10.0.0.1/",        // private
             "http://localhost/",       // localhost domain
             "http://x.localhost/",     // .localhost subdomain
+            "http://localhost./",      // root-dotted localhost
+            "http://LOCALHOST./",      // mixed case, root-dotted
+            "http://a.localhost./",    // root-dotted .localhost subdomain
             "ftp://example.com/",      // non-http scheme
         ] {
             assert!(check_url_safe(u).is_err(), "{u} should be blocked");
@@ -1472,10 +1476,20 @@ mod url_safety_tests {
         for u in [
             "http://example.com/",
             "https://example.com/path",
+            "http://example.com./",           // root-dotted public host
             "http://[2606:4700:4700::1111]/", // public IPv6 (Cloudflare DNS)
         ] {
             assert!(check_url_safe(u).is_ok(), "{u} should be allowed");
         }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn safe_resolver_refuses_a_name_that_resolves_to_loopback() {
+        use reqwest::dns::Resolve;
+        use std::str::FromStr;
+        let name = reqwest::dns::Name::from_str("localhost").unwrap();
+        assert!(super::SafeResolver.resolve(name).await.is_err());
     }
 
     fn matches(url: &str, prefix: &str) -> bool {
