@@ -781,6 +781,43 @@ fn redir_stderr_to_file() {
     }));
 }
 
+// A redirect that cannot open reports why, for a builtin and for a command alike.
+#[test]
+fn redir_open_failure_reports_on_stderr() {
+    let (rt, local) = rt();
+    rt.block_on(local.run_until(async {
+        let mut shell = Shell::builder().build().unwrap();
+        for (cmd, written) in [
+            ("echo hi", "hi\n"),
+            ("printf x", "x"),
+            ("cat /dev/null", ""),
+        ] {
+            let out = shell.run(&format!("{cmd} > /nonexistent/x")).await;
+            assert_eq!(out.status, 1, "{cmd}: status");
+            assert!(out.stdout.is_empty(), "{cmd}: stdout {:?}", out.stdout);
+            assert!(
+                out.stderr.contains("/nonexistent/x")
+                    && out.stderr.to_lowercase().contains("no such file"),
+                "{cmd}: stderr {:?}",
+                out.stderr
+            );
+
+            let out = shell.run(&format!("{cmd} > /tmp/redir_ok")).await;
+            assert_eq!(out.status, 0, "{cmd}: control status");
+            assert!(
+                out.stderr.is_empty(),
+                "{cmd}: control stderr {:?}",
+                out.stderr
+            );
+            let out = shell
+                .run("test -f /tmp/redir_ok && cat /tmp/redir_ok")
+                .await;
+            assert_eq!(out.status, 0, "{cmd}: control file missing");
+            assert_eq!(out.stdout, written, "{cmd}: control file");
+        }
+    }));
+}
+
 // Clobber redirect >|
 expect!(redir_clobber, "echo hello >| /tmp/r; cat /tmp/r", "hello");
 
@@ -1512,6 +1549,53 @@ expect!(
     "1"
 );
 
+// ── builtin builtin ─────────────────────────────────────────────────
+
+expect!(builtin_runs_echo, "builtin echo hello", "hello");
+expect!(builtin_passes_args, "builtin printf '%s-%s\\n' a b", "a-b");
+expect!(builtin_keeps_status, "builtin false; echo $?", "1");
+expect!(builtin_no_args, "builtin", "");
+expect!(
+    builtin_bypasses_function,
+    "echo() { printf 'shadowed\\n'; }; builtin echo real",
+    "real"
+);
+expect!(
+    builtin_in_wrapper_function,
+    "go() { builtin cd \"$@\"; }; go /tmp; pwd",
+    "/tmp"
+);
+expect!(
+    builtin_special_return,
+    "f() { builtin return 4; echo unreachable; }; f; echo $?",
+    "4"
+);
+expect_status!(builtin_special_exit, "builtin exit 3; echo unreachable", 3);
+
+shell_test!(
+    builtin_rejects_command,
+    "builtin cat /dev/null",
+    |_shell: &mut Shell, out: strands_shell::Output| {
+        assert_eq!(out.status, 1);
+        assert_eq!(
+            out.stderr.trim(),
+            "strands-shell: builtin: cat: not a shell builtin"
+        );
+    }
+);
+
+shell_test!(
+    builtin_rejects_unknown,
+    "builtin nosuch_xyz",
+    |_shell: &mut Shell, out: strands_shell::Output| {
+        assert_eq!(out.status, 1);
+        assert_eq!(
+            out.stderr.trim(),
+            "strands-shell: builtin: nosuch_xyz: not a shell builtin"
+        );
+    }
+);
+
 // ── Redirections: read-write, dup, close ────────────────────────────
 
 expect!(
@@ -1713,6 +1797,16 @@ fn readonly_var() {
 // ── unset ───────────────────────────────────────────────────────────
 
 expect!(unset_var, "X=hello; unset X; echo \"${X:-gone}\"", "gone");
+expect!(
+    unset_option_terminator_treats_dash_f_as_name,
+    "X=hello; unset -- -f X; echo \"${X:-gone}\"",
+    "gone"
+);
+expect!(
+    unset_func_option_terminator,
+    "f() { echo hi; }; unset -f -- f; f 2>/dev/null; echo $?",
+    "127"
+);
 #[test]
 fn unset_func() {
     let (rt, local) = rt();
@@ -2656,6 +2750,21 @@ expect!(
     "printf 'a\\nb\\nc\\nd\\ne\\n' | tail -n +3",
     "c\nd\ne"
 );
+expect!(
+    tail_legacy_count_stdin,
+    "printf 'a\\nb\\nc\\n' | tail -1",
+    "c"
+);
+expect!(
+    tail_legacy_count_from_file,
+    "printf 'a\\nb\\nc\\nd\\n' > /tmp/tl; tail -2 /tmp/tl",
+    "c\nd"
+);
+expect!(
+    tail_dash_operand_after_terminator,
+    "printf 'a\\nb\\n' > /tmp/-2; cd /tmp; tail -n1 -- -2",
+    "b"
+);
 
 // ── uniq coverage ───────────────────────────────────────────────────
 
@@ -2710,6 +2819,31 @@ shell_test!(
         assert_eq!(out.stdout, "ab\n\n");
         assert_eq!(out.status, 0);
     }
+);
+expect!(
+    head_legacy_count_stdin,
+    "printf 'a\\nb\\nc\\n' | head -2",
+    "a\nb"
+);
+expect!(
+    head_legacy_count_from_file,
+    "printf 'a\\nb\\nc\\nd\\n' > /tmp/hl; head -3 /tmp/hl",
+    "a\nb\nc"
+);
+expect!(
+    head_legacy_count_then_lines_last_wins,
+    "printf 'a\\nb\\nc\\n' | head -2 -n1",
+    "a"
+);
+expect!(
+    head_dash_operand_after_terminator,
+    "printf 'a\\nb\\n' > /tmp/-3; cd /tmp; head -n1 -- -3",
+    "a"
+);
+expect!(
+    head_bytes_after_legacy_count,
+    "printf 'abcdef' | head -3 -c 2",
+    "ab"
 );
 expect!(head_bytes_stdin, "printf 'abcdef' | head -c 3", "abc");
 expect!(head_bytes_long, "printf 'abcdef' | head --bytes=2", "ab");
@@ -2915,6 +3049,16 @@ expect!(
     unalias_all,
     "alias a=1; alias b=2; unalias -a; alias; echo done",
     "done"
+);
+expect!(
+    unalias_option_terminator,
+    "alias ll=ls; unalias -- ll; echo $?; alias ll 2>/dev/null; echo $?",
+    "0\n1"
+);
+expect!(
+    unalias_option_terminator_keeps_dash_a_as_name,
+    "alias a=1; unalias -- -a 2>/dev/null; echo $?; alias a",
+    "1\na='1'"
 );
 
 // ── hash builtin ────────────────────────────────────────────────────
@@ -3404,8 +3548,6 @@ fn timeout_is_per_command_not_cumulative() {
 
 // And the deadline must still actually fire mid-command for slow
 // commands — refreshing on entry shouldn't disable enforcement.
-// Uses a busy `while true` loop because the `sleep` builtin races
-// the deadline silently and exits 0.
 #[test]
 fn timeout_still_fires_within_a_command() {
     let (rt, local) = rt();
@@ -3421,6 +3563,41 @@ fn timeout_still_fires_within_a_command() {
             "expected timeout error, got: {:?}",
             out.stderr
         );
+    }));
+}
+
+// A sleep cut short by the deadline did not happen, so it must fail
+// with the timeout error rather than exit 0.
+#[test]
+fn timeout_interrupts_sleep_with_failure() {
+    let (rt, local) = rt();
+    rt.block_on(local.run_until(async {
+        let mut shell = Shell::builder()
+            .timeout(std::time::Duration::from_millis(200))
+            .build()
+            .unwrap();
+        let out = shell.run("sleep 5").await;
+        assert_ne!(out.status, 0, "sleep past the deadline must fail");
+        assert_eq!(
+            out.stderr.trim(),
+            "strands-shell: execution timeout exceeded",
+            "stderr={:?}",
+            out.stderr
+        );
+    }));
+}
+
+#[test]
+fn sleep_within_timeout_succeeds() {
+    let (rt, local) = rt();
+    rt.block_on(local.run_until(async {
+        let mut shell = Shell::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let out = shell.run("sleep 0.05").await;
+        assert_eq!(out.status, 0, "stderr={:?}", out.stderr);
+        assert!(out.stderr.is_empty(), "stderr={:?}", out.stderr);
     }));
 }
 
@@ -3783,6 +3960,208 @@ expect!(
     "x y z"
 );
 
+// ── exec: compound status in command substitution ──────────────────
+expect!(
+    cmd_subst_group_false_and,
+    "X=$({ false; } && echo yes); echo \"[$X]\"",
+    "[]"
+);
+expect!(
+    cmd_subst_group_false_or,
+    "X=$({ false; } || echo no); echo \"[$X]\"",
+    "[no]"
+);
+expect!(
+    cmd_subst_group_false_status,
+    "X=$({ false; }; echo $?); echo \"[$X]\"",
+    "[1]"
+);
+expect!(
+    cmd_subst_group_true_and,
+    "X=$({ true; } && echo yes); echo \"[$X]\"",
+    "[yes]"
+);
+expect!(
+    cmd_subst_group_true_or,
+    "X=$({ true; } || echo no); echo \"[$X]\"",
+    "[]"
+);
+expect!(
+    cmd_subst_subshell_false_and,
+    "X=$( (false) && echo yes); echo \"[$X]\"",
+    "[]"
+);
+expect!(
+    cmd_subst_subshell_false_or,
+    "X=$( (false) || echo no); echo \"[$X]\"",
+    "[no]"
+);
+expect!(
+    cmd_subst_subshell_false_status,
+    "X=$( (false); echo $?); echo \"[$X]\"",
+    "[1]"
+);
+expect!(
+    cmd_subst_subshell_true_and,
+    "X=$( (true) && echo yes); echo \"[$X]\"",
+    "[yes]"
+);
+expect!(
+    cmd_subst_subshell_true_or,
+    "X=$( (true) || echo no); echo \"[$X]\"",
+    "[]"
+);
+expect!(
+    cmd_subst_if_false_and,
+    "X=$(if true; then false; fi && echo yes); echo \"[$X]\"",
+    "[]"
+);
+expect!(
+    cmd_subst_if_false_or,
+    "X=$(if true; then false; fi || echo no); echo \"[$X]\"",
+    "[no]"
+);
+expect!(
+    cmd_subst_if_false_status,
+    "X=$(if true; then false; fi; echo $?); echo \"[$X]\"",
+    "[1]"
+);
+expect!(
+    cmd_subst_if_true_and,
+    "X=$(if true; then true; fi && echo yes); echo \"[$X]\"",
+    "[yes]"
+);
+expect!(
+    cmd_subst_if_true_or,
+    "X=$(if true; then true; fi || echo no); echo \"[$X]\"",
+    "[]"
+);
+expect!(
+    cmd_subst_for_false_and,
+    "X=$(for i in 1; do false; done && echo yes); echo \"[$X]\"",
+    "[]"
+);
+expect!(
+    cmd_subst_for_false_or,
+    "X=$(for i in 1; do false; done || echo no); echo \"[$X]\"",
+    "[no]"
+);
+expect!(
+    cmd_subst_for_false_status,
+    "X=$(for i in 1; do false; done; echo $?); echo \"[$X]\"",
+    "[1]"
+);
+expect!(
+    cmd_subst_for_true_and,
+    "X=$(for i in 1; do true; done && echo yes); echo \"[$X]\"",
+    "[yes]"
+);
+expect!(
+    cmd_subst_for_true_or,
+    "X=$(for i in 1; do true; done || echo no); echo \"[$X]\"",
+    "[]"
+);
+expect!(
+    cmd_subst_while_false_and,
+    "X=$(n=0; while [ $n -lt 1 ]; do n=1; false; done && echo yes); echo \"[$X]\"",
+    "[]"
+);
+expect!(
+    cmd_subst_while_false_or,
+    "X=$(n=0; while [ $n -lt 1 ]; do n=1; false; done || echo no); echo \"[$X]\"",
+    "[no]"
+);
+expect!(
+    cmd_subst_while_false_status,
+    "X=$(n=0; while [ $n -lt 1 ]; do n=1; false; done; echo $?); echo \"[$X]\"",
+    "[1]"
+);
+expect!(
+    cmd_subst_while_true_and,
+    "X=$(n=0; while [ $n -lt 1 ]; do n=1; true; done && echo yes); echo \"[$X]\"",
+    "[yes]"
+);
+expect!(
+    cmd_subst_while_true_or,
+    "X=$(n=0; while [ $n -lt 1 ]; do n=1; true; done || echo no); echo \"[$X]\"",
+    "[]"
+);
+expect!(
+    cmd_subst_until_false_and,
+    "X=$(n=0; until [ $n -ge 1 ]; do n=1; false; done && echo yes); echo \"[$X]\"",
+    "[]"
+);
+expect!(
+    cmd_subst_until_false_or,
+    "X=$(n=0; until [ $n -ge 1 ]; do n=1; false; done || echo no); echo \"[$X]\"",
+    "[no]"
+);
+expect!(
+    cmd_subst_until_false_status,
+    "X=$(n=0; until [ $n -ge 1 ]; do n=1; false; done; echo $?); echo \"[$X]\"",
+    "[1]"
+);
+expect!(
+    cmd_subst_until_true_and,
+    "X=$(n=0; until [ $n -ge 1 ]; do n=1; true; done && echo yes); echo \"[$X]\"",
+    "[yes]"
+);
+expect!(
+    cmd_subst_until_true_or,
+    "X=$(n=0; until [ $n -ge 1 ]; do n=1; true; done || echo no); echo \"[$X]\"",
+    "[]"
+);
+expect!(
+    cmd_subst_case_false_and,
+    "X=$(case a in (a) false;; esac && echo yes); echo \"[$X]\"",
+    "[]"
+);
+expect!(
+    cmd_subst_case_false_or,
+    "X=$(case a in (a) false;; esac || echo no); echo \"[$X]\"",
+    "[no]"
+);
+expect!(
+    cmd_subst_case_false_status,
+    "X=$(case a in (a) false;; esac; echo $?); echo \"[$X]\"",
+    "[1]"
+);
+expect!(
+    cmd_subst_case_true_and,
+    "X=$(case a in (a) true;; esac && echo yes); echo \"[$X]\"",
+    "[yes]"
+);
+expect!(
+    cmd_subst_case_true_or,
+    "X=$(case a in (a) true;; esac || echo no); echo \"[$X]\"",
+    "[]"
+);
+expect!(
+    cmd_subst_group_last_status_wins,
+    "X=$({ false; true; } && echo yes; { true; false; } || echo no); echo \"[$X]\"",
+    "[yes\nno]"
+);
+expect!(
+    cmd_subst_if_unmatched_is_success,
+    "X=$(if false; then false; fi && echo yes); echo \"[$X]\"",
+    "[yes]"
+);
+expect!(
+    cmd_subst_empty_loop_is_success,
+    "X=$(false; for i in; do false; done && echo yes); echo \"[$X]\"",
+    "[yes]"
+);
+expect!(
+    cmd_subst_case_unmatched_is_success,
+    "X=$(false; case a in (b) false;; esac && echo yes); echo \"[$X]\"",
+    "[yes]"
+);
+expect!(
+    cmd_subst_pipeline_status,
+    "X=$(false; echo $?); echo \"[$X]\"",
+    "[1]"
+);
+
 // ── exec: shebang / script execution ──────────────────────────────
 expect!(
     script_shebang_source,
@@ -4076,6 +4455,26 @@ fn builder_max_input() {
 }
 
 #[test]
+fn max_input_applies_to_whole_multiline_input() {
+    let (rt, local) = rt();
+    rt.block_on(local.run_until(async {
+        let mut shell = Shell::builder().max_input(16).build().unwrap();
+        // Each line is under the limit, but the whole input is not
+        let out = shell.run("echo aaaa\necho bbbb\necho cccc").await;
+        assert_eq!(
+            (out.status, out.stdout.as_str(), out.stderr.as_str()),
+            (1, "", "strands-shell: input too large\n")
+        );
+        // Multiline input within the limit still runs
+        let out = shell.run("echo a\necho b").await;
+        assert_eq!(
+            (out.status, out.stdout.as_str(), out.stderr.as_str()),
+            (0, "a\nb\n", "")
+        );
+    }));
+}
+
+#[test]
 fn builder_max_file_size() {
     let (rt, local) = rt();
     rt.block_on(local.run_until(async {
@@ -4250,17 +4649,24 @@ fn max_output_truncates_subst() {
 fn max_input_in_subst() {
     let (rt, local) = rt();
     rt.block_on(local.run_until(async {
-        // The top-level command is `cat <<EOF`, which is under the limit.
-        // The heredoc body reaches capture_output, which checks the limit again.
+        // The sourced script's first command is `cat <<EOF`, which is under
+        // the limit. The heredoc body reaches capture_output, which checks
+        // the limit again.
         let mut shell = Shell::builder().max_input(12).build().unwrap();
-        let out = shell.run("cat <<EOF\n$(echo short)\nEOF").await;
+        shell
+            .write_file("/tmp/s", b"cat <<EOF\n$(echo short)\nEOF\n")
+            .await
+            .unwrap();
+        shell
+            .write_file("/tmp/l", b"cat <<EOF\n$(echo aaaaaaaaaaaaaaaaaaaa)\nEOF\n")
+            .await
+            .unwrap();
+        let out = shell.run(". /tmp/s").await;
         assert_eq!(
             (out.status, out.stdout.as_str(), out.stderr.as_str()),
             (0, "short\n", "")
         );
-        let out = shell
-            .run("cat <<EOF\n$(echo aaaaaaaaaaaaaaaaaaaa)\nEOF")
-            .await;
+        let out = shell.run(". /tmp/l").await;
         assert_eq!(out.stdout, "\n");
         assert_eq!(out.stderr, "strands-shell: input too large\n");
     }));
@@ -4460,6 +4866,41 @@ fn subst_max_output_truncate() {
             .await;
         let len: usize = out.stdout.trim().parse().unwrap_or(999);
         assert!(len <= 10, "expected truncated, got len {}", len);
+    }));
+}
+
+// ── max_output truncation keeps multibyte characters whole ─────────
+
+async fn run_with_max_output(max: usize, script: &str) -> strands_shell::Output {
+    let mut shell = Shell::builder().max_output(max).build().unwrap();
+    shell.run(script).await
+}
+
+#[test]
+fn subst_max_output_truncate_multibyte() {
+    let (rt, local) = rt();
+    rt.block_on(local.run_until(async {
+        let out = run_with_max_output(4, "X=$(printf abc; printf é); printf %s \"$X\"").await;
+        assert_eq!(out.stdout, "abc");
+        let out = run_with_max_output(4, "X=$(printf ab; printf é); printf %s \"$X\"").await;
+        assert_eq!(out.stdout, "abé");
+        let out = run_with_max_output(4, "X=$(printf abc; printf de); printf %s \"$X\"").await;
+        assert_eq!(out.stdout, "abcd");
+    }));
+}
+
+#[test]
+fn stdout_max_output_truncate_multibyte() {
+    let (rt, local) = rt();
+    rt.block_on(local.run_until(async {
+        let out = run_with_max_output(4, "printf abc; printf é").await;
+        assert_eq!((out.stdout.as_str(), out.status), ("abc", 1));
+        let out = run_with_max_output(4, "printf ab; printf cé").await;
+        assert_eq!((out.stdout.as_str(), out.status), ("abc", 1));
+        let out = run_with_max_output(4, "printf abé").await;
+        assert_eq!((out.stdout.as_str(), out.status), ("abé", 0));
+        let out = run_with_max_output(4, "printf ab; printf cde").await;
+        assert_eq!((out.stdout.as_str(), out.status), ("abcd", 1));
     }));
 }
 
@@ -7982,6 +8423,32 @@ fn empty_pipeline_stage_no_panic() {
             // Must not panic — any non-zero exit is fine
             assert_ne!(out.status, -1, "{cmd} should not crash");
         }
+    }));
+}
+
+// ── function depth is tracked through pipeline stages ─────────────
+
+#[test]
+fn pipeline_function_depth_limited() {
+    let (rt, local) = rt();
+    rt.block_on(local.run_until(async {
+        let mut shell = Shell::builder()
+            .max_depth(4)
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap();
+        // Two nested function calls through pipelines — within limit
+        let out = shell
+            .run("g() { echo ok | cat; }; f() { g | cat; }; f | cat")
+            .await;
+        assert_eq!((out.stdout.as_str(), out.stderr.as_str()), ("ok\n", ""));
+        // Unbounded recursion through a pipeline stage stops at the depth
+        // limit; each call appends one line before it recurses
+        let out = shell
+            .run("r() { echo x >> /tmp/calls; r | cat; }; r; wc -l < /tmp/calls")
+            .await;
+        let calls: u32 = out.stdout.trim().parse().unwrap_or(u32::MAX);
+        assert!(calls < 4, "calls: {calls}, stderr: {}", out.stderr);
     }));
 }
 
