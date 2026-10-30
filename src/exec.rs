@@ -1576,6 +1576,54 @@ fn is_control_flow(pipeline: &[parser::Command]) -> bool {
     )
 }
 
+/// Prepare control flow without propagating it until its redirections succeed.
+async fn execute_captured_control_flow(
+    os: Arc<dyn Kernel>,
+    proc: &mut Process,
+    pipeline: &[parser::Command],
+) -> Result<i32, ControlFlow> {
+    // Expand the command arguments before the redirection targets, as run_pipeline does.
+    let result = Box::pin(execute_pipeline_checked(os.clone(), proc, pipeline)).await;
+    let mut redirects = Vec::new();
+    for redir in &pipeline[0].redirects {
+        let target = match redir {
+            Redirect::Write(_, word)
+            | Redirect::Append(_, word)
+            | Redirect::Read(_, word)
+            | Redirect::ReadWrite(_, word)
+            | Redirect::Clobber(_, word)
+            | Redirect::DupWrite(_, word)
+            | Redirect::DupRead(_, word) => expand_word(os.clone(), proc, word).await,
+            Redirect::HereDoc(..) => String::new(),
+        };
+        redirects.push((redir.clone(), target));
+    }
+    if proc.nounset_error {
+        return Ok(2);
+    }
+    if redirects.is_empty() {
+        return result;
+    }
+
+    // These commands produce no output, but need stdout/stderr for fd duplication.
+    // Keep their redirections local so a failed command cannot alter the caller's fds.
+    let mut io_proc = proc.fork();
+    let (out_tx, _out_rx) = os::pipe(64);
+    let (err_tx, _err_rx) = os::pipe(64);
+    io_proc.set_channel_writer(STDOUT, out_tx);
+    io_proc.set_channel_writer(STDERR, err_tx);
+    let redirected = apply_redirects(&os, &mut io_proc, &redirects).await;
+    proc.captured_stderr.push_str(&io_proc.captured_stderr);
+    drop(io_proc);
+    // Closing redirected writers lets the VFS finish any pending writes.
+    tokio::task::yield_now().await;
+    if let Err(msg) = redirected {
+        proc.err_msg(&format!("strands-shell: {msg}"));
+        return Ok(1);
+    }
+    result
+}
+
 /// The exit status of a captured command line that ran to its end or stopped on control flow.
 fn captured_status(result: Result<i32, ControlFlow>, last_exit: i32) -> i32 {
     match result {
@@ -1605,9 +1653,12 @@ async fn run_capturing_status(
         }
         if !skip {
             let (exit, out) = match item {
-                Item::Pipeline(pipeline, _) if is_control_flow(pipeline) => {
-                    match Box::pin(execute_pipeline_checked(os.clone(), proc, pipeline)).await {
-                        Ok(exit) => (exit, String::new()),
+                Item::Pipeline(pipeline, negated) if is_control_flow(pipeline) => {
+                    match execute_captured_control_flow(os.clone(), proc, pipeline).await {
+                        Ok(exit) => {
+                            let exit = if *negated { i32::from(exit == 0) } else { exit };
+                            (exit, String::new())
+                        }
                         Err(control) => {
                             flow = Some(control);
                             (proc.last_exit, String::new())

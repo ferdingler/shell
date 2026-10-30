@@ -4259,6 +4259,68 @@ expect!(
     "1"
 );
 
+// Redirection failures must prevent the control-flow command from executing.
+expect!(
+    cmd_subst_control_redirect_break_failure,
+    "X=$(for i in 1 2; do break </missing || echo failed; echo $i; done); echo \"[$X]\"",
+    "[failed\n1\nfailed\n2]"
+);
+expect!(
+    cmd_subst_control_redirect_continue_failure,
+    "X=$(for i in 1 2; do continue </missing || echo failed; echo $i; done); echo \"[$X]\"",
+    "[failed\n1\nfailed\n2]"
+);
+expect!(
+    cmd_subst_control_redirect_exit_failure,
+    "X=$(exit 3 >/missing/dir/out || echo failed; echo after); echo \"[$X]\"",
+    "[failed\nafter]"
+);
+expect!(
+    cmd_subst_control_redirect_return_failure,
+    "f() { X=$(return 3 </missing || echo failed; echo after); echo \"[$X]\"; }; f",
+    "[failed\nafter]"
+);
+expect!(
+    cmd_subst_control_redirect_builtin_failure,
+    "X=$(for i in 1 2; do builtin break </missing || echo failed; echo $i; done); echo \"[$X]\"",
+    "[failed\n1\nfailed\n2]"
+);
+expect!(
+    cmd_subst_control_redirect_negated_failure,
+    "X=$(! exit 3 </missing && echo recovered; echo after); echo \"[$X]\"",
+    "[recovered\nafter]"
+);
+expect!(
+    cmd_subst_control_redirect_create,
+    "X=$(exit 3 >/tmp/marker); test -f /tmp/marker; echo $?; echo after",
+    "0\nafter"
+);
+expect!(
+    cmd_subst_control_redirect_truncate,
+    "echo old >/tmp/out; X=$(exit 3 >/tmp/out); test ! -s /tmp/out; echo $?",
+    "0"
+);
+expect!(
+    cmd_subst_control_redirect_append,
+    "echo old >/tmp/out; X=$(exit 3 >>/tmp/out); cat /tmp/out",
+    "old"
+);
+expect!(
+    cmd_subst_control_redirect_dup,
+    "X=$(for i in 1 2; do echo $i; builtin break 3>/tmp/out 1>&3 2>&1; done); echo \"[$X]\"; test -f /tmp/out; echo $?",
+    "[1]\n0"
+);
+expect!(
+    cmd_subst_control_redirect_expansion,
+    "X=$(for i in 1 2; do echo $i; break >\"/tmp/out$i\"; done); echo \"[$X]\"; test -f /tmp/out1; echo $?",
+    "[1]\n0"
+);
+expect!(
+    cmd_subst_control_redirect_stays_local,
+    "X=$(for i in 1 2; do continue >/tmp/out; done; echo after); echo \"[$X]\"; test ! -s /tmp/out; echo $?",
+    "[after]\n0"
+);
+
 // ── exec: shebang / script execution ──────────────────────────────
 expect!(
     script_shebang_source,
