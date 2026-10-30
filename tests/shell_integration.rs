@@ -4321,6 +4321,173 @@ expect!(
     "[after]\n0"
 );
 
+// Control flow must pass through output redirections and conditions.
+expect!(
+    cmd_subst_break_in_output_redirected_group,
+    "X=$(for i in 1 2; do { echo $i; break; } >/tmp/out; echo m$i; done); echo \"[$X]\"; cat /tmp/out",
+    "[]\n1"
+);
+expect!(
+    cmd_subst_continue_in_output_redirected_group,
+    "X=$(for i in 1 2; do { echo $i; continue; } >/tmp/out; echo m$i; done); echo \"[$X]\"; cat /tmp/out",
+    "[]\n2"
+);
+expect!(
+    cmd_subst_break_in_append_redirected_group,
+    "echo old >/tmp/out; X=$(for i in 1 2; do { echo $i; break; } >>/tmp/out; echo m$i; done); echo \"[$X]\"; cat /tmp/out",
+    "[]\nold\n1"
+);
+expect!(
+    cmd_subst_break_n_in_output_redirected_group,
+    "X=$(for i in 1 2; do for j in a b; do { echo $j; break 2; } >/tmp/out; done; echo m$i; done); echo \"[$X]\"; cat /tmp/out",
+    "[]\na"
+);
+expect!(
+    cmd_subst_break_in_output_redirected_if,
+    "X=$(for i in 1 2; do if true; then echo $i; break; fi >/tmp/out; echo m$i; done); echo \"[$X]\"; cat /tmp/out",
+    "[]\n1"
+);
+expect!(
+    cmd_subst_exit_in_output_redirected_group,
+    "X=$({ echo a; exit 4; } >/tmp/out; echo after); echo \"[$X]\"; cat /tmp/out",
+    "[]\na"
+);
+expect!(
+    break_in_output_redirected_group,
+    "for i in 1 2; do { echo $i; break; } >/tmp/out; echo m$i; done; cat /tmp/out",
+    "1"
+);
+expect!(
+    cmd_subst_output_redirect_failure_skips_group,
+    "X=$(for i in 1 2; do { echo $i; break; } >/missing/dir/out; echo m$i; done); echo \"[$X]\"",
+    "[m1\nm2]"
+);
+expect!(
+    output_redirect_failure_skips_group,
+    "{ echo a; } >/missing/dir/out; echo $?",
+    "1"
+);
+expect!(
+    cmd_subst_exit_in_if_condition,
+    "X=$(if exit 3; then echo yes; else echo no; fi; echo after); echo \"[$X]\"",
+    "[]"
+);
+expect!(
+    cmd_subst_exit_in_elif_condition,
+    "X=$(if false; then echo yes; elif exit 3; then echo elif; else echo no; fi; echo after); echo \"[$X]\"",
+    "[]"
+);
+expect!(
+    cmd_subst_exit_in_while_condition,
+    "X=$(while exit 3; do echo body; done; echo after); echo \"[$X]\"",
+    "[]"
+);
+expect!(
+    cmd_subst_exit_in_until_condition,
+    "X=$(until exit 3; do echo body; done; echo after); echo \"[$X]\"",
+    "[]"
+);
+expect!(
+    cmd_subst_exit_in_condition_list,
+    "X=$(if true && exit 3; then echo yes; fi; echo after); echo \"[$X]\"",
+    "[]"
+);
+expect!(
+    cmd_subst_exit_in_while_condition_list,
+    "X=$(while false || exit 3; do echo body; done; echo after); echo \"[$X]\"",
+    "[]"
+);
+expect!(
+    cmd_subst_break_in_if_condition,
+    "X=$(for i in 1 2; do if break; then echo y; fi; echo $i; done); echo \"[$X]\"",
+    "[]"
+);
+expect!(
+    cmd_subst_break_in_while_condition,
+    "X=$(for i in 1 2; do while break; do :; done; echo $i; done); echo \"[$X]\"",
+    "[1\n2]"
+);
+expect!(
+    cmd_subst_break_in_until_condition,
+    "X=$(for i in 1 2; do until break; do :; done; echo $i; done); echo \"[$X]\"",
+    "[1\n2]"
+);
+expect!(
+    cmd_subst_break_n_in_while_condition,
+    "X=$(for i in 1 2; do while break 2; do :; done; echo $i; done; echo end); echo \"[$X]\"",
+    "[end]"
+);
+expect!(
+    cmd_subst_continue_in_until_condition,
+    "X=$(for i in 1 2; do until continue; do echo w; done; echo $i; done); echo \"[$X]\"",
+    "[1\n2]"
+);
+expect!(
+    cmd_subst_continue_n_in_while_condition,
+    "X=$(for i in 1 2; do while continue 2; do echo w; done; echo $i; done; echo end); echo \"[$X]\"",
+    "[end]"
+);
+expect!(
+    cmd_subst_return_in_if_condition,
+    "f() { X=$(if return 3; then echo y; fi; echo after); echo \"[$X]\"; }; f",
+    "[]"
+);
+expect!(
+    break_in_while_condition,
+    "for i in 1 2; do while break; do :; done; echo $i; done",
+    "1\n2"
+);
+expect!(
+    break_n_in_while_condition,
+    "for i in 1 2; do while break 2; do :; done; echo $i; done; echo end",
+    "end"
+);
+expect!(
+    continue_in_until_condition,
+    "for i in 1 2; do until continue; do echo w; done; echo $i; done; echo end",
+    "1\n2\nend"
+);
+expect!(
+    continue_n_in_while_condition,
+    "for i in 1 2; do while continue 2; do echo w; done; echo $i; done; echo end",
+    "end"
+);
+expect!(
+    errexit_false_while_condition_in_redirected_loop,
+    "set -e; i=0; while [ $i -lt 2 ]; do i=$((i+1)); done >/tmp/out; echo ok $i",
+    "ok 2"
+);
+expect!(
+    errexit_false_if_condition_in_redirected_group,
+    "set -e; { if false; then :; fi; echo in; } >/tmp/out; echo ok; cat /tmp/out",
+    "ok\nin"
+);
+expect!(
+    cmd_subst_errexit_false_elif_condition,
+    "set -e; X=$(if false; then :; elif true; then echo elif; fi); echo \"[$X]\"",
+    "[elif]"
+);
+expect!(
+    cmd_subst_errexit_false_until_condition,
+    "set -e; X=$(n=0; until [ $n -ge 1 ]; do n=1; done; echo ok); echo \"[$X]\"",
+    "[ok]"
+);
+expect!(
+    continue_in_negated_while_condition,
+    "for i in 1 2; do while ! continue; do echo w; done; echo $i; done; echo end",
+    "1\n2\nend"
+);
+expect!(
+    cmd_subst_continue_in_negated_while_condition,
+    "X=$(for i in 1 2; do while ! continue; do echo w; done; echo $i; done; echo end); echo \"[$X]\"",
+    "[1\n2\nend]"
+);
+expect!(
+    break_in_negated_until_condition,
+    "for i in 1 2; do until ! break; do echo w; done; echo $i; done; echo end",
+    "1\n2\nend"
+);
+
 // ── exec: shebang / script execution ──────────────────────────────
 expect!(
     script_shebang_source,

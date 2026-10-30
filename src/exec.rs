@@ -18,6 +18,18 @@ enum ControlFlow {
     Exit(i32),
 }
 
+/// Whether the innermost loop runs its next iteration after `control`, or the control flow
+/// that leaves it.
+fn loop_control(control: ControlFlow) -> Result<bool, ControlFlow> {
+    match control {
+        ControlFlow::Break(n) if n > 1 => Err(ControlFlow::Break(n - 1)),
+        ControlFlow::Break(_) => Ok(false),
+        ControlFlow::Continue(n) if n > 1 => Err(ControlFlow::Continue(n - 1)),
+        ControlFlow::Continue(_) => Ok(true),
+        other => Err(other),
+    }
+}
+
 fn is_special(name: &str) -> bool {
     matches!(
         name,
@@ -1702,12 +1714,21 @@ async fn run_capturing_status(
                     let mut result = (String::new(), Ok(0));
                     let mut matched = false;
                     for (cond, body) in branches {
-                        let exit = Box::pin(execute_command_line(os.clone(), proc, cond)).await;
-                        if exit == 0 {
-                            result = Box::pin(run_capturing_status(os.clone(), proc, body)).await;
-                            matched = true;
-                            break;
+                        let saved = proc.opt_errexit;
+                        proc.opt_errexit = false;
+                        let cond =
+                            Box::pin(execute_command_line_inner(os.clone(), proc, cond)).await;
+                        proc.opt_errexit = saved;
+                        match cond {
+                            Ok(0) => {
+                                result =
+                                    Box::pin(run_capturing_status(os.clone(), proc, body)).await;
+                            }
+                            Ok(_) => continue,
+                            Err(control) => result = (String::new(), Err(control)),
                         }
+                        matched = true;
+                        break;
                     }
                     if !matched && let Some(body) = else_body {
                         result = Box::pin(run_capturing_status(os.clone(), proc, body)).await;
@@ -1726,27 +1747,30 @@ async fn run_capturing_status(
                     let mut s = String::new();
                     let mut exit = 0;
                     loop {
-                        let cond_exit =
-                            Box::pin(execute_command_line(os.clone(), proc, condition)).await;
-                        if (is_until && cond_exit == 0) || (!is_until && cond_exit != 0) {
-                            break;
-                        }
-                        let (out, result) =
-                            Box::pin(run_capturing_status(os.clone(), proc, body)).await;
-                        s.push_str(&out);
-                        match result {
+                        let saved = proc.opt_errexit;
+                        proc.opt_errexit = false;
+                        let cond =
+                            Box::pin(execute_command_line_inner(os.clone(), proc, condition)).await;
+                        proc.opt_errexit = saved;
+                        let result = match cond {
+                            Ok(cond_exit) => {
+                                if (is_until && cond_exit == 0) || (!is_until && cond_exit != 0) {
+                                    break;
+                                }
+                                let (out, result) =
+                                    Box::pin(run_capturing_status(os.clone(), proc, body)).await;
+                                s.push_str(&out);
+                                result
+                            }
+                            // `continue` in a condition ends its loop.
+                            Err(ControlFlow::Continue(n)) if n <= 1 => break,
+                            Err(control) => Err(control),
+                        };
+                        match result.map_err(loop_control) {
                             Ok(body_exit) => exit = body_exit,
-                            Err(ControlFlow::Break(n)) if n > 1 => {
-                                flow = Some(ControlFlow::Break(n - 1));
-                                break;
-                            }
-                            Err(ControlFlow::Break(_)) => break,
-                            Err(ControlFlow::Continue(n)) if n > 1 => {
-                                flow = Some(ControlFlow::Continue(n - 1));
-                                break;
-                            }
-                            Err(ControlFlow::Continue(_)) => continue,
-                            Err(control) => {
+                            Err(Ok(true)) => continue,
+                            Err(Ok(false)) => break,
+                            Err(Err(control)) => {
                                 flow = Some(control);
                                 break;
                             }
@@ -1763,19 +1787,11 @@ async fn run_capturing_status(
                         let (out, result) =
                             Box::pin(run_capturing_status(os.clone(), proc, body)).await;
                         s.push_str(&out);
-                        match result {
+                        match result.map_err(loop_control) {
                             Ok(body_exit) => exit = body_exit,
-                            Err(ControlFlow::Break(n)) if n > 1 => {
-                                flow = Some(ControlFlow::Break(n - 1));
-                                break;
-                            }
-                            Err(ControlFlow::Break(_)) => break,
-                            Err(ControlFlow::Continue(n)) if n > 1 => {
-                                flow = Some(ControlFlow::Continue(n - 1));
-                                break;
-                            }
-                            Err(ControlFlow::Continue(_)) => continue,
-                            Err(control) => {
+                            Err(Ok(true)) => continue,
+                            Err(Ok(false)) => break,
+                            Err(Err(control)) => {
                                 flow = Some(control);
                                 break;
                             }
@@ -1889,10 +1905,13 @@ async fn run_capturing_status(
                             item: item.clone(),
                             redirects: redirects.clone(),
                         };
-                        let exit = Box::pin(execute_item(os.clone(), proc, &cr))
-                            .await
-                            .unwrap_or(1);
-                        (exit, String::new())
+                        match Box::pin(execute_item(os.clone(), proc, &cr)).await {
+                            Ok(exit) => (exit, String::new()),
+                            Err(control) => {
+                                flow = Some(control);
+                                (proc.last_exit, String::new())
+                            }
+                        }
                     } else {
                         let inner_cl = vec![(*item.clone(), None)];
                         let (s, result) =
@@ -1919,19 +1938,6 @@ async fn run_capturing_status(
         }
     }
     (output, Ok(last_exit))
-}
-
-/// Public-facing execute_command_line that swallows break/continue.
-async fn execute_command_line(
-    os: Arc<dyn Kernel>,
-    proc: &mut Process,
-    command_line: &parser::CommandLine,
-) -> i32 {
-    match execute_command_line_inner(os, proc, command_line).await {
-        Ok(code) => code,
-        Err(ControlFlow::Exit(code)) => code,
-        Err(_) => proc.last_exit,
-    }
 }
 
 /// Inner execute that propagates ControlFlow.
@@ -2125,13 +2131,8 @@ async fn execute_item(
             }
             // For stdout/stderr redirects, capture output and write to target
             if !stdout_expanded.is_empty() {
-                let inner_cl = vec![(*item.clone(), None)];
-                let captured = Box::pin(run_capturing(os.clone(), proc, &inner_cl)).await;
-                if !stdin_expanded.is_empty() {
-                    proc.close(STDIN);
-                    saved_stdin.transfer_fd(STDIN, proc);
-                }
-                // Write captured output to each redirect target
+                // Open the targets before the body runs.
+                let mut writers = Vec::new();
                 for (redir, target) in &stdout_expanded {
                     let fd_num = match redir {
                         Redirect::Write(fd, _)
@@ -2145,17 +2146,32 @@ async fn execute_item(
                             Redirect::Append(..) => OpenFlags::append(),
                             _ => OpenFlags::write(),
                         };
-                        if let Ok(fd) = os.open(proc, target, flags).await
-                            && let Ok(mut w) = proc.take_writer(fd)
-                        {
-                            use tokio::io::AsyncWriteExt;
-                            let _ = w.write_all(captured.as_bytes()).await;
+                        match os.open(proc, target, flags).await {
+                            Ok(fd) => writers.extend(proc.take_writer(fd)),
+                            Err(e) => {
+                                if !stdin_expanded.is_empty() {
+                                    proc.close(STDIN);
+                                    saved_stdin.transfer_fd(STDIN, proc);
+                                }
+                                proc.err_msg(&format!("strands-shell: {target}: {e}"));
+                                return Ok(1);
+                            }
                         }
                     }
                 }
+                let inner_cl = vec![(*item.clone(), None)];
+                let (captured, result) =
+                    Box::pin(run_capturing_status(os.clone(), proc, &inner_cl)).await;
+                if !stdin_expanded.is_empty() {
+                    proc.close(STDIN);
+                    saved_stdin.transfer_fd(STDIN, proc);
+                }
+                for mut w in writers {
+                    let _ = w.write_all(captured.as_bytes()).await;
+                }
                 // Yield to let write-back tasks flush
                 tokio::task::yield_now().await;
-                Ok(proc.last_exit)
+                result.map(|_| proc.last_exit)
             } else {
                 let result = Box::pin(execute_item(os, proc, item)).await;
                 if !stdin_expanded.is_empty() {
@@ -2203,8 +2219,16 @@ async fn execute_while(
         // Condition is a "tested" context — suppress errexit
         let saved = proc.opt_errexit;
         proc.opt_errexit = false;
-        let cond_exit = execute_command_line_inner(os.clone(), proc, condition).await?;
+        let cond = execute_command_line_inner(os.clone(), proc, condition).await;
         proc.opt_errexit = saved;
+        let cond_exit = match cond {
+            Ok(cond_exit) => cond_exit,
+            // Control flow in a condition ends its loop, or leaves it.
+            Err(control) => {
+                loop_control(control)?;
+                break;
+            }
+        };
         proc.last_exit = cond_exit;
         let should_run = if invert {
             cond_exit != 0
@@ -2216,19 +2240,11 @@ async fn execute_while(
         }
         match execute_command_line_inner(os.clone(), proc, body).await {
             Ok(exit) => last_exit = exit,
-            Err(ControlFlow::Break(n)) => {
-                if n > 1 {
-                    return Err(ControlFlow::Break(n - 1));
+            Err(control) => {
+                if !loop_control(control)? {
+                    break;
                 }
-                break;
             }
-            Err(ControlFlow::Continue(n)) => {
-                if n > 1 {
-                    return Err(ControlFlow::Continue(n - 1));
-                }
-                continue;
-            }
-            Err(e) => return Err(e),
         }
     }
     Ok(last_exit)
@@ -2247,19 +2263,11 @@ async fn execute_for(
         proc.set_env(var, val);
         match execute_command_line_inner(os.clone(), proc, body).await {
             Ok(exit) => last_exit = exit,
-            Err(ControlFlow::Break(n)) => {
-                if n > 1 {
-                    return Err(ControlFlow::Break(n - 1));
+            Err(control) => {
+                if !loop_control(control)? {
+                    break;
                 }
-                break;
             }
-            Err(ControlFlow::Continue(n)) => {
-                if n > 1 {
-                    return Err(ControlFlow::Continue(n - 1));
-                }
-                continue;
-            }
-            Err(e) => return Err(e),
         }
     }
     Ok(last_exit)
