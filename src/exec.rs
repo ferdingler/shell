@@ -1560,15 +1560,41 @@ async fn run_capturing(
     run_capturing_status(os, proc, command_line).await.0
 }
 
-/// [`run_capturing`], also returning the exit status of the last item it ran.
+/// Whether `pipeline` is a lone `break`, `continue`, `exit` or `return`, with or without `builtin`.
+fn is_control_flow(pipeline: &[parser::Command]) -> bool {
+    let [command] = pipeline else {
+        return false;
+    };
+    let mut names = command.args.iter().map(parser::word_to_str);
+    let mut name = names.next().flatten();
+    if name.as_deref() == Some("builtin") {
+        name = names.next().flatten();
+    }
+    matches!(
+        name.as_deref(),
+        Some("break" | "continue" | "exit" | "return")
+    )
+}
+
+/// The exit status of a captured command line that ran to its end or stopped on control flow.
+fn captured_status(result: Result<i32, ControlFlow>, last_exit: i32) -> i32 {
+    match result {
+        Ok(code) | Err(ControlFlow::Exit(code)) => code,
+        Err(_) => last_exit,
+    }
+}
+
+/// [`run_capturing`], also returning the exit status of the last item it ran, or the
+/// control flow that stopped it.
 async fn run_capturing_status(
     os: Arc<dyn Kernel>,
     proc: &mut Process,
     command_line: &parser::CommandLine,
-) -> (String, i32) {
+) -> (String, Result<i32, ControlFlow>) {
     let mut output = String::new();
     let mut last_exit = 0;
     let mut skip = false;
+    let mut flow = None;
     for (i, (item, _connector)) in command_line.iter().enumerate() {
         if i > 0 {
             match &command_line[i - 1].1 {
@@ -1579,6 +1605,15 @@ async fn run_capturing_status(
         }
         if !skip {
             let (exit, out) = match item {
+                Item::Pipeline(pipeline, _) if is_control_flow(pipeline) => {
+                    match Box::pin(execute_pipeline_checked(os.clone(), proc, pipeline)).await {
+                        Ok(exit) => (exit, String::new()),
+                        Err(control) => {
+                            flow = Some(control);
+                            (proc.last_exit, String::new())
+                        }
+                    }
+                }
                 Item::Pipeline(pipeline, negated) => {
                     let (mut exit, out) =
                         execute_pipeline_capture(os.clone(), proc, pipeline).await;
@@ -1588,8 +1623,14 @@ async fn run_capturing_status(
                     (exit, out)
                 }
                 Item::Group(cl) => {
-                    let (s, exit) = Box::pin(run_capturing_status(os.clone(), proc, cl)).await;
-                    (exit, s)
+                    let (s, result) = Box::pin(run_capturing_status(os.clone(), proc, cl)).await;
+                    match result {
+                        Ok(exit) => (exit, s),
+                        Err(control) => {
+                            flow = Some(control);
+                            (proc.last_exit, s)
+                        }
+                    }
                 }
                 Item::Subshell(cl) => {
                     let mut sub = proc.fork();
@@ -1598,33 +1639,36 @@ async fn run_capturing_status(
                         sub.err_msg(msg);
                         (1, String::new())
                     } else {
-                        let (s, exit) =
+                        let (s, result) =
                             Box::pin(run_capturing_status(os.clone(), &mut sub, cl)).await;
-                        (exit, s)
+                        (captured_status(result, sub.last_exit), s)
                     }
                 }
                 Item::If {
                     branches,
                     else_body,
                 } => {
-                    let mut result = (0, String::new());
+                    let mut result = (String::new(), Ok(0));
                     let mut matched = false;
                     for (cond, body) in branches {
                         let exit = Box::pin(execute_command_line(os.clone(), proc, cond)).await;
                         if exit == 0 {
-                            let (s, exit) =
-                                Box::pin(run_capturing_status(os.clone(), proc, body)).await;
-                            result = (exit, s);
+                            result = Box::pin(run_capturing_status(os.clone(), proc, body)).await;
                             matched = true;
                             break;
                         }
                     }
                     if !matched && let Some(body) = else_body {
-                        let (s, exit) =
-                            Box::pin(run_capturing_status(os.clone(), proc, body)).await;
-                        result = (exit, s);
+                        result = Box::pin(run_capturing_status(os.clone(), proc, body)).await;
                     }
-                    result
+                    let (s, result) = result;
+                    match result {
+                        Ok(exit) => (exit, s),
+                        Err(control) => {
+                            flow = Some(control);
+                            (proc.last_exit, s)
+                        }
+                    }
                 }
                 Item::While { condition, body } | Item::Until { condition, body } => {
                     let is_until = matches!(item, Item::Until { .. });
@@ -1636,10 +1680,26 @@ async fn run_capturing_status(
                         if (is_until && cond_exit == 0) || (!is_until && cond_exit != 0) {
                             break;
                         }
-                        let (out, body_exit) =
+                        let (out, result) =
                             Box::pin(run_capturing_status(os.clone(), proc, body)).await;
                         s.push_str(&out);
-                        exit = body_exit;
+                        match result {
+                            Ok(body_exit) => exit = body_exit,
+                            Err(ControlFlow::Break(n)) if n > 1 => {
+                                flow = Some(ControlFlow::Break(n - 1));
+                                break;
+                            }
+                            Err(ControlFlow::Break(_)) => break,
+                            Err(ControlFlow::Continue(n)) if n > 1 => {
+                                flow = Some(ControlFlow::Continue(n - 1));
+                                break;
+                            }
+                            Err(ControlFlow::Continue(_)) => continue,
+                            Err(control) => {
+                                flow = Some(control);
+                                break;
+                            }
+                        }
                     }
                     (exit, s)
                 }
@@ -1649,10 +1709,26 @@ async fn run_capturing_status(
                     let mut exit = 0;
                     for val in &expanded {
                         proc.set_env(var, val);
-                        let (out, body_exit) =
+                        let (out, result) =
                             Box::pin(run_capturing_status(os.clone(), proc, body)).await;
                         s.push_str(&out);
-                        exit = body_exit;
+                        match result {
+                            Ok(body_exit) => exit = body_exit,
+                            Err(ControlFlow::Break(n)) if n > 1 => {
+                                flow = Some(ControlFlow::Break(n - 1));
+                                break;
+                            }
+                            Err(ControlFlow::Break(_)) => break,
+                            Err(ControlFlow::Continue(n)) if n > 1 => {
+                                flow = Some(ControlFlow::Continue(n - 1));
+                                break;
+                            }
+                            Err(ControlFlow::Continue(_)) => continue,
+                            Err(control) => {
+                                flow = Some(control);
+                                break;
+                            }
+                        }
                     }
                     (exit, s)
                 }
@@ -1670,8 +1746,16 @@ async fn run_capturing_status(
                             }
                         }
                         if matched {
-                            (s, exit) =
+                            let result;
+                            (s, result) =
                                 Box::pin(run_capturing_status(os.clone(), proc, &arm.body)).await;
+                            match result {
+                                Ok(body_exit) => exit = body_exit,
+                                Err(control) => {
+                                    flow = Some(control);
+                                    exit = proc.last_exit;
+                                }
+                            }
                             break;
                         }
                     }
@@ -1740,7 +1824,12 @@ async fn run_capturing_status(
                             (1, String::new())
                         } else {
                             let inner_cl = vec![(*item.clone(), None)];
-                            let s = Box::pin(run_capturing(os.clone(), &mut sub, &inner_cl)).await;
+                            let (s, result) =
+                                Box::pin(run_capturing_status(os.clone(), &mut sub, &inner_cl))
+                                    .await;
+                            if let Err(control) = result {
+                                flow = Some(control);
+                            }
                             (0, s)
                         }
                     } else if !stdout_redir.is_empty() {
@@ -1755,7 +1844,11 @@ async fn run_capturing_status(
                         (exit, String::new())
                     } else {
                         let inner_cl = vec![(*item.clone(), None)];
-                        let s = Box::pin(run_capturing(os.clone(), &mut sub, &inner_cl)).await;
+                        let (s, result) =
+                            Box::pin(run_capturing_status(os.clone(), &mut sub, &inner_cl)).await;
+                        if let Err(control) = result {
+                            flow = Some(control);
+                        }
                         (0, s)
                     }
                 }
@@ -1769,9 +1862,12 @@ async fn run_capturing_status(
                 proc.last_exit = 1;
                 break;
             }
+            if let Some(control) = flow {
+                return (output, Err(control));
+            }
         }
     }
-    (output, last_exit)
+    (output, Ok(last_exit))
 }
 
 /// Public-facing execute_command_line that swallows break/continue.

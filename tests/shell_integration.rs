@@ -4162,6 +4162,103 @@ expect!(
     "[1]"
 );
 
+// ── exec: loop control and exit in command substitution ────────────
+expect!(
+    cmd_subst_for_break,
+    "X=$(for i in 1 2; do echo $i; break; done); echo \"[$X]\"",
+    "[1]"
+);
+expect!(
+    cmd_subst_while_break,
+    "X=$(n=0; while [ $n -lt 3 ]; do n=$((n+1)); echo $n; break; done); echo \"[$X]\"",
+    "[1]"
+);
+expect!(
+    cmd_subst_until_break,
+    "X=$(n=0; until [ $n -ge 3 ]; do n=$((n+1)); echo $n; break; done); echo \"[$X]\"",
+    "[1]"
+);
+expect!(
+    cmd_subst_for_continue,
+    "X=$(for i in 1 2 3; do if [ $i = 2 ]; then continue; fi; echo $i; done); echo \"[$X]\"",
+    "[1\n3]"
+);
+expect!(
+    cmd_subst_break_n,
+    "X=$(for i in 1 2; do for j in a b; do echo $i$j; break 2; done; done); echo \"[$X]\"",
+    "[1a]"
+);
+expect!(
+    cmd_subst_continue_n,
+    "X=$(for i in 1 2; do for j in a b; do echo $i$j; continue 2; done; done); echo \"[$X]\"",
+    "[1a\n2a]"
+);
+expect!(
+    cmd_subst_break_in_case,
+    "X=$(for i in 1 2; do case $i in (*) echo $i; break;; esac; done); echo \"[$X]\"",
+    "[1]"
+);
+expect!(
+    cmd_subst_break_in_subshell_stays_in_subshell,
+    "X=$(for i in 1 2; do (break); echo $i; done); echo \"[$X]\"",
+    "[1\n2]"
+);
+expect!(
+    cmd_subst_exit_stops_substitution,
+    "X=$(echo a; exit 3; echo b); echo \"[$X]\"; echo after",
+    "[a]\nafter"
+);
+expect!(
+    cmd_subst_exit_in_loop_and_group,
+    "X=$(for i in 1 2; do { echo $i; exit 5; }; done; echo end); echo \"[$X]\"",
+    "[1]"
+);
+expect!(
+    cmd_subst_exit_in_subshell_status,
+    "X=$(echo a; (exit 2); echo \"s$?\"); echo \"[$X]\"",
+    "[a\ns2]"
+);
+expect!(
+    cmd_subst_while_continue,
+    "X=$(n=0; while [ $n -lt 3 ]; do n=$((n+1)); [ $n = 2 ] && continue; echo $n; done); echo \"[$X]\"",
+    "[1\n3]"
+);
+expect!(
+    cmd_subst_builtin_break,
+    "X=$(for i in 1 2; do echo $i; builtin break; done); echo \"[$X]\"",
+    "[1]"
+);
+expect!(
+    cmd_subst_break_status,
+    "X=$(for i in 1; do false; break; done; echo \"s$?\"); echo \"[$X]\"",
+    "[s0]"
+);
+expect!(
+    cmd_subst_break_in_redirected_group,
+    "X=$(for i in 1 2; do { echo $i; break; } </dev/null; echo m$i; done); echo \"[$X]\"",
+    "[1]"
+);
+expect!(
+    cmd_subst_return_in_function,
+    "f() { echo $(for i in 1 2; do echo $i; return 3; done; echo e); }; f",
+    "1"
+);
+expect!(
+    cmd_subst_break_does_not_leave_substitution,
+    "for i in 1 2; do X=$(break); echo $i; done",
+    "1\n2"
+);
+expect!(
+    cmd_subst_exit_does_not_end_script,
+    "X=$(exit 3); echo after",
+    "after"
+);
+expect!(
+    compound_pipeline_break,
+    "for i in 1 2; do echo $i; break; done | cat",
+    "1"
+);
+
 // ── exec: shebang / script execution ──────────────────────────────
 expect!(
     script_shebang_source,
