@@ -33,7 +33,10 @@ type Instant = std::time::Instant;
 /// Decline with `Ok(None)` before using the streams or starting external
 /// work. Shell drops the future when the execution deadline expires or the
 /// foreground execution is dropped; the handler must then stop and reap any
-/// external work it started.
+/// external work it started. After a dropped execution, the drop happens the
+/// next time the runtime polls the shell's tasks. On `wasm32`, Shell checks
+/// the deadline only before it calls the handler, so the handler must enforce
+/// [`CommandContext::deadline`] itself.
 #[async_trait]
 pub trait CommandFallback: Send + Sync {
     async fn run(&self, ctx: &mut CommandContext) -> io::Result<Option<i32>>;
@@ -67,7 +70,8 @@ impl AsyncRead for CommandInput {
 /// The command's redirected stdout or stderr.
 ///
 /// Shutdown releases the writer, so a reader sees end of file before the
-/// handler returns. Later writes fail with [`io::ErrorKind::BrokenPipe`].
+/// handler returns, unless another descriptor such as `2>&1` still refers to
+/// the same pipe. Later writes fail with [`io::ErrorKind::BrokenPipe`].
 pub struct CommandOutput {
     inner: Option<FdWriter>,
 }
@@ -152,7 +156,8 @@ impl CommandContext {
         &self.cwd
     }
 
-    /// The Shell environment, including command-local assignments.
+    /// The Shell variables, including command-local assignments, unexported
+    /// variables, and function locals.
     pub fn env(&self) -> &HashMap<String, String> {
         &self.env
     }

@@ -292,6 +292,51 @@ fn the_issue_examples_run_inside_the_script() {
 }
 
 #[test]
+fn a_returned_127_runs_the_handler_once() {
+    block_on(async {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut shell = recording_shell(calls.clone());
+        let out = shell.run("cargo status127; echo $?").await;
+        assert_eq!(out.stdout, "127\n");
+        assert_eq!(out.stderr, "");
+        assert_eq!(calls.lock().unwrap().len(), 1);
+    });
+}
+
+#[test]
+fn closed_or_absent_descriptors_stay_unavailable() {
+    block_on(async {
+        let mut shell = host_shell(|ctx| {
+            Box::pin(async move {
+                let (stdin, stdout, stderr) = ctx.stdio();
+                let seen = format!(
+                    "{} {} {}\n",
+                    stdin.is_some(),
+                    stdout.is_some(),
+                    stderr.is_some()
+                );
+                if let Some(stderr) = stderr {
+                    stderr.write_all(seen.as_bytes()).await?;
+                }
+                Ok(Some(0))
+            })
+        });
+        let cases = [
+            ("probe", "false true true\n"),
+            ("echo x | probe", "true true true\n"),
+            ("true | probe <&-", "false true true\n"),
+            ("probe >&-", "false false true\n"),
+        ];
+        for (script, stderr) in cases {
+            let out = shell.run(script).await;
+            assert_eq!(out.status, 0, "{script}");
+            assert_eq!(out.stderr, stderr, "{script}");
+        }
+        assert_eq!(shell.run("probe 2>&-").await.stderr, "");
+    });
+}
+
+#[test]
 fn a_handled_status_drives_control_flow() {
     block_on(async {
         let mut shell = recording_shell(Arc::new(Mutex::new(Vec::new())));
@@ -659,16 +704,21 @@ fn stdin_close_releases_the_writer_before_the_handler_returns() {
 fn the_deadline_drops_the_handler_and_returns_one() {
     block_on(async {
         let active = Arc::new(AtomicBool::new(false));
-        let flag = active.clone();
-        let mut shell = host_shell(move |_ctx| {
-            let flag = flag.clone();
+        let started = Arc::new(AtomicBool::new(false));
+        let seen_deadline = Arc::new(Mutex::new(None));
+        let (flag, start, seen) = (active.clone(), started.clone(), seen_deadline.clone());
+        let mut shell = host_shell(move |ctx| {
+            let (flag, start) = (flag.clone(), start.clone());
+            *seen.lock().unwrap() = ctx.deadline();
             Box::pin(async move {
                 let _active = Active::new(flag);
+                start.store(true, Ordering::SeqCst);
                 pending::<()>().await;
                 Ok(Some(0))
             })
         });
-        shell.proc.deadline = Some(tokio::time::Instant::now() + Duration::from_millis(30));
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(30);
+        shell.proc.deadline = Some(deadline);
         let out = tokio::time::timeout(Duration::from_secs(5), shell.run("blocked"))
             .await
             .expect("the deadline did not bound the handler");
@@ -677,7 +727,9 @@ fn the_deadline_drops_the_handler_and_returns_one() {
             out.stderr,
             "strands-shell: blocked: execution timeout exceeded\n"
         );
+        assert!(started.load(Ordering::SeqCst), "the handler never started");
         assert!(!active.load(Ordering::SeqCst));
+        assert_eq!(*seen_deadline.lock().unwrap(), Some(deadline));
 
         shell.proc.deadline = None;
         assert_eq!(shell.run("echo okay").await.stdout, "okay\n");
@@ -694,17 +746,30 @@ fn dropping_run_cancels_the_handler_future() {
             "blocked | cat",
         ] {
             let active = Arc::new(AtomicBool::new(false));
-            let flag = active.clone();
+            let started = Arc::new(Notify::new());
+            let (flag, start) = (active.clone(), started.clone());
             let mut shell = host_shell(move |_ctx| {
-                let flag = flag.clone();
+                let (flag, start) = (flag.clone(), start.clone());
                 Box::pin(async move {
                     let _active = Active::new(flag);
+                    start.notify_one();
                     pending::<()>().await;
                     Ok(Some(0))
                 })
             });
-            let out = tokio::time::timeout(Duration::from_millis(30), shell.run(script)).await;
-            assert!(out.is_err(), "{script}");
+            let out = tokio::time::timeout(Duration::from_secs(5), async {
+                tokio::select! {
+                    _ = shell.run(script) => false,
+                    _ = started.notified() => true,
+                }
+            })
+            .await;
+            assert_eq!(
+                out.ok(),
+                Some(true),
+                "the handler never started in {script}"
+            );
+            assert!(active.load(Ordering::SeqCst), "{script}");
             settle().await;
             assert!(
                 !active.load(Ordering::SeqCst),
