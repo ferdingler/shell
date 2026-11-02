@@ -5543,6 +5543,75 @@ fn bind_direct_readlink_does_not_follow_a_directory_out_of_the_bind() {
     }));
 }
 
+#[cfg(unix)]
+#[test]
+fn bind_direct_ln_s_stores_the_target_text() {
+    let (rt, local) = rt();
+    rt.block_on(local.run_until(async {
+        let dir = TestDir::new("lsh_bind_ln_s_test");
+        std::fs::create_dir(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("f"), "content").unwrap();
+        let mut shell = Shell::builder()
+            .bind_direct(dir.to_str().unwrap(), "/b")
+            .build()
+            .unwrap();
+        let out = shell
+            .run("ln -s f /b/rel && ln -s ../f /b/sub/up && cd /b && ln -s nowhere dangling && cat /b/rel /b/sub/up")
+            .await;
+        assert_eq!(out.status, 0, "stderr: {}", out.stderr);
+        assert_eq!(out.stdout, "contentcontent");
+        let link_text = |p: &str| std::fs::read_link(dir.join(p)).unwrap();
+        assert_eq!(link_text("rel"), std::path::Path::new("f"));
+        assert_eq!(link_text("sub/up"), std::path::Path::new("../f"));
+        assert_eq!(link_text("dangling"), std::path::Path::new("nowhere"));
+        let out = shell.run("ln -s other /b/f").await;
+        assert_eq!(out.status, 1);
+        assert_eq!(std::fs::read(dir.join("f")).unwrap(), b"content");
+    }));
+}
+
+#[cfg(unix)]
+#[test]
+fn bind_direct_ln_s_stays_inside_the_bind() {
+    let (rt, local) = rt();
+    rt.block_on(local.run_until(async {
+        let dir = TestDir::new("lsh_bind_ln_s_escape_test");
+        std::fs::create_dir_all(dir.join("mount")).unwrap();
+        std::fs::create_dir_all(dir.join("outside")).unwrap();
+        std::fs::write(dir.join("secret"), "ESCAPED").unwrap();
+        std::os::unix::fs::symlink(dir.join("outside"), dir.join("mount/escape")).unwrap();
+        let mut shell = Shell::builder()
+            .bind_direct(dir.join("mount").to_str().unwrap(), "/b")
+            .build()
+            .unwrap();
+        let out = shell.run("ln -s x /b/escape/planted").await;
+        assert_ne!(out.status, 0);
+        assert!(std::fs::symlink_metadata(dir.join("outside/planted")).is_err());
+        let secret = dir.join("secret");
+        let out = shell
+            .run(&format!("ln -s {} /b/out; cat /b/out", secret.display()))
+            .await;
+        assert!(!out.stdout.contains("ESCAPED"), "stdout: {}", out.stdout);
+    }));
+}
+
+#[cfg(unix)]
+#[test]
+fn bind_direct_readonly_ln_s_fails() {
+    let (rt, local) = rt();
+    rt.block_on(local.run_until(async {
+        let dir = TestDir::new("lsh_bind_ro_ln_s_test");
+        let mut shell = Shell::builder()
+            .bind_direct_readonly(dir.to_str().unwrap(), "/b")
+            .build()
+            .unwrap();
+        let out = shell.run("ln -s x /b/link").await;
+        assert_eq!(out.status, 1);
+        assert!(out.stderr.contains("read-only"), "stderr: {}", out.stderr);
+        assert!(std::fs::symlink_metadata(dir.join("link")).is_err());
+    }));
+}
+
 #[test]
 fn builder_credential_bearer() {
     let (rt, local) = rt();

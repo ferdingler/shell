@@ -705,6 +705,16 @@ impl Kernel for VfsKernel {
     async fn symlink(&self, proc: &Process, target: &str, link: &str) -> io::Result<()> {
         let abs_link = Self::abs(proc, link);
         let mut vfs = self.vfs.lock().await;
+        if let Some((host_link, ro)) = Self::resolve_host_nofollow(&vfs, &abs_link) {
+            drop(vfs);
+            if ro {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "read-only bind mount",
+                ));
+            }
+            return host_symlink(target, &host_link);
+        }
         Self::check_parent_write(&vfs, &abs_link)?;
         vfs.symlink(&abs_link, target, LASH_UID, LASH_GID)?;
         Ok(())
@@ -1069,6 +1079,19 @@ impl Kernel for VfsKernel {
 }
 
 // --- host stat helper ---
+
+#[cfg(unix)]
+fn host_symlink(target: &str, link: &std::path::Path) -> io::Result<()> {
+    std::os::unix::fs::symlink(target, link)
+}
+
+#[cfg(not(unix))]
+fn host_symlink(_target: &str, _link: &std::path::Path) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "symbolic links are not supported on this host",
+    ))
+}
 
 #[cfg(not(target_arch = "wasm32"))]
 async fn host_stat(path: &std::path::Path) -> FileStat {
